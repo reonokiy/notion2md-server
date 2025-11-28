@@ -8,7 +8,8 @@ on:
   workflow_dispatch:
 
 env:
-  IMAGE: ghcr.io/${{ github.repository }}/notion2md-server:latest
+  IMAGE: ghcr.io/${{ github.repository }}:latest
+  CACHE_IMAGE: ghcr.io/${{ github.repository }}/buildcache:latest
 
 jobs:
   build-amd64:
@@ -39,8 +40,8 @@ jobs:
           set: |
             notion2md-server.platform=linux/amd64
             notion2md-server.tags=${{ env.IMAGE }}
-            notion2md-server.cache-to=type=registry,ref=ghcr.io/${{ github.repository }}/notion2md-server:buildcache,mode=max,compression=zstd
-            notion2md-server.cache-from=type=registry,ref=ghcr.io/${{ github.repository }}/notion2md-server:buildcache
+            notion2md-server.cache-to=type=registry,ref=${{ env.CACHE_IMAGE }},mode=max,compression=zstd
+            notion2md-server.cache-from=type=registry,ref=${{ env.CACHE_IMAGE }}
           push: ${{ github.event_name == 'push' }}
 
       - name: Export digest
@@ -78,8 +79,8 @@ jobs:
           set: |
             notion2md-server.platform=linux/arm64
             notion2md-server.tags=${{ env.IMAGE }}
-            notion2md-server.cache-to=type=registry,ref=ghcr.io/${{ github.repository }}/notion2md-server:buildcache,mode=max,compression=zstd
-            notion2md-server.cache-from=type=registry,ref=ghcr.io/${{ github.repository }}/notion2md-server:buildcache
+            notion2md-server.cache-to=type=registry,ref=${{ env.CACHE_IMAGE }},mode=max,compression=zstd
+            notion2md-server.cache-from=type=registry,ref=${{ env.CACHE_IMAGE }}
           push: ${{ github.event_name == 'push' }}
 
       - name: Export digest
