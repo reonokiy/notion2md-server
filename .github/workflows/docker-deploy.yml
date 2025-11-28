@@ -21,8 +21,15 @@ on:
       - ".github/workflows/docker-deploy.yml"
   workflow_dispatch:
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 env:
-  IMAGE: ghcr.io/${{ github.repository }}:latest
+  IMAGE_BASE: ghcr.io/${{ github.repository }}
+  IMAGE_TAG_LATEST: ghcr.io/${{ github.repository }}:latest
+  IMAGE_AMD64: ghcr.io/${{ github.repository }}:latest-amd64
+  IMAGE_ARM64: ghcr.io/${{ github.repository }}:latest-arm64
   CACHE_IMAGE: ghcr.io/${{ github.repository }}-buildcache:latest
 
 jobs:
@@ -53,17 +60,13 @@ jobs:
           targets: notion2md-server
           set: |
             notion2md-server.platform=linux/amd64
-            notion2md-server.tags=${{ env.IMAGE }}
+            notion2md-server.tags=${{ env.IMAGE_AMD64 }}
             notion2md-server.cache-to=type=registry,ref=${{ env.CACHE_IMAGE }},mode=max,compression=zstd
             notion2md-server.cache-from=type=registry,ref=${{ env.CACHE_IMAGE }}
           push: ${{ github.event_name == 'push' }}
 
-      - name: Export digest
-        if: github.event_name == 'push'
-        id: out
-        run: echo "digest=${{ steps.bake.outputs['target-digest-notion2md-server'] }}" >> "$GITHUB_OUTPUT"
     outputs:
-      digest: ${{ steps.out.outputs.digest }}
+      digest: ${{ steps.bake.outputs['target-digest-notion2md-server'] }}
 
   build-arm64:
     runs-on: ubuntu-24.04-arm
@@ -92,17 +95,13 @@ jobs:
           targets: notion2md-server
           set: |
             notion2md-server.platform=linux/arm64
-            notion2md-server.tags=${{ env.IMAGE }}
+            notion2md-server.tags=${{ env.IMAGE_ARM64 }}
             notion2md-server.cache-to=type=registry,ref=${{ env.CACHE_IMAGE }},mode=max,compression=zstd
             notion2md-server.cache-from=type=registry,ref=${{ env.CACHE_IMAGE }}
           push: ${{ github.event_name == 'push' }}
 
-      - name: Export digest
-        if: github.event_name == 'push'
-        id: out
-        run: echo "digest=${{ steps.bake.outputs['target-digest-notion2md-server'] }}" >> "$GITHUB_OUTPUT"
     outputs:
-      digest: ${{ steps.out.outputs.digest }}
+      digest: ${{ steps.bake.outputs['target-digest-notion2md-server'] }}
 
   manifest:
     needs: [build-amd64, build-arm64]
@@ -124,12 +123,7 @@ jobs:
 
       - name: Create multi-arch manifest and push
         run: |
-          AMD64="${{ needs.build-amd64.outputs.digest }}"
-          ARM64="${{ needs.build-arm64.outputs.digest }}"
+          AMD64_TAG="${{ env.IMAGE_AMD64 }}"
+          ARM64_TAG="${{ env.IMAGE_ARM64 }}"
 
-          if [ -z "$AMD64" ] || [ -z "$ARM64" ]; then
-            echo "Missing digests: amd64='$AMD64' arm64='$ARM64'" >&2
-            exit 1
-          fi
-
-          docker buildx imagetools create -t "$IMAGE" "$AMD64" "$ARM64"
+          docker buildx imagetools create -t "${{ env.IMAGE_TAG_LATEST }}" "$AMD64_TAG" "$ARM64_TAG"
