@@ -7,9 +7,12 @@ on:
     branches: ["main"]
   workflow_dispatch:
 
+env:
+  IMAGE: ghcr.io/${{ github.repository }}/notion2md-server:latest
+
 jobs:
-  build-and-push:
-    runs-on: ubuntu-latest
+  build-amd64:
+    runs-on: ubuntu-24.04
     permissions:
       contents: read
       packages: write
@@ -27,9 +30,80 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Build and push via Docker Bake
+      - name: Build amd64 image with Bake
+        id: bake
         uses: docker/bake-action@v5
         with:
           files: ./docker-bake.hcl
-          targets: default
+          targets: notion2md-server
+          set: |
+            notion2md-server.platform=linux/amd64
           push: ${{ github.event_name == 'push' }}
+
+      - name: Export digest
+        if: github.event_name == 'push'
+        id: out
+        run: echo "digest=${{ steps.bake.outputs['target-digest-notion2md-server'] }}" >> "$GITHUB_OUTPUT"
+    outputs:
+      digest: ${{ steps.out.outputs.digest }}
+
+  build-arm64:
+    runs-on: ubuntu-24.04-arm
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build arm64 image with Bake
+        id: bake
+        uses: docker/bake-action@v5
+        with:
+          files: ./docker-bake.hcl
+          targets: notion2md-server
+          set: |
+            notion2md-server.platform=linux/arm64
+          push: ${{ github.event_name == 'push' }}
+
+      - name: Export digest
+        if: github.event_name == 'push'
+        id: out
+        run: echo "digest=${{ steps.bake.outputs['target-digest-notion2md-server'] }}" >> "$GITHUB_OUTPUT"
+    outputs:
+      digest: ${{ steps.out.outputs.digest }}
+
+  manifest:
+    needs: [build-amd64, build-arm64]
+    if: github.event_name == 'push'
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Create multi-arch manifest and push
+        run: |
+          docker buildx imagetools create \
+            -t "$IMAGE" \
+            ${{ needs.build-amd64.outputs.digest }} \
+            ${{ needs.build-arm64.outputs.digest }}
