@@ -30,7 +30,8 @@ env:
   IMAGE_TAG_LATEST: ghcr.io/${{ github.repository }}:latest
   IMAGE_AMD64: ghcr.io/${{ github.repository }}:latest-amd64
   IMAGE_ARM64: ghcr.io/${{ github.repository }}:latest-arm64
-  CACHE_IMAGE: ghcr.io/${{ github.repository }}-buildcache:latest
+  CACHE_IMAGE_AMD64: ghcr.io/${{ github.repository }}-buildcache:amd64
+  CACHE_IMAGE_ARM64: ghcr.io/${{ github.repository }}-buildcache:arm64
 
 jobs:
   build-amd64:
@@ -61,8 +62,8 @@ jobs:
           set: |
             notion2md-server.platform=linux/amd64
             notion2md-server.tags=${{ env.IMAGE_AMD64 }}
-            notion2md-server.cache-to=type=registry,ref=${{ env.CACHE_IMAGE }},mode=max,compression=zstd
-            notion2md-server.cache-from=type=registry,ref=${{ env.CACHE_IMAGE }}
+            notion2md-server.cache-to=type=registry,ref=${{ env.CACHE_IMAGE_AMD64 }},mode=max,compression=zstd
+            notion2md-server.cache-from=type=registry,ref=${{ env.CACHE_IMAGE_AMD64 }}
           push: ${{ github.event_name == 'push' }}
 
     outputs:
@@ -96,8 +97,8 @@ jobs:
           set: |
             notion2md-server.platform=linux/arm64
             notion2md-server.tags=${{ env.IMAGE_ARM64 }}
-            notion2md-server.cache-to=type=registry,ref=${{ env.CACHE_IMAGE }},mode=max,compression=zstd
-            notion2md-server.cache-from=type=registry,ref=${{ env.CACHE_IMAGE }}
+            notion2md-server.cache-to=type=registry,ref=${{ env.CACHE_IMAGE_ARM64 }},mode=max,compression=zstd
+            notion2md-server.cache-from=type=registry,ref=${{ env.CACHE_IMAGE_ARM64 }}
           push: ${{ github.event_name == 'push' }}
 
     outputs:
