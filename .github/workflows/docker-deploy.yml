@@ -110,7 +110,12 @@ jobs:
 
       - name: Create multi-arch manifest and push
         run: |
-          docker buildx imagetools create \
-            -t "$IMAGE" \
-            ${{ needs.build-amd64.outputs.digest }} \
-            ${{ needs.build-arm64.outputs.digest }}
+          AMD64="${{ needs.build-amd64.outputs.digest }}"
+          ARM64="${{ needs.build-arm64.outputs.digest }}"
+
+          if [ -z "$AMD64" ] || [ -z "$ARM64" ]; then
+            echo "Missing digests: amd64='$AMD64' arm64='$ARM64'" >&2
+            exit 1
+          fi
+
+          docker buildx imagetools create -t "$IMAGE" "$AMD64" "$ARM64"
