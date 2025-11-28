@@ -1,0 +1,22 @@
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: notion2md-server
+  labels:
+    app: notion2md-server
+spec:
+  tls:
+    - hosts:
+        - notion.example.com # replace with your domain
+      secretName: notion2md-tls
+  rules:
+    - host: notion.example.com # keep in sync with tls.hosts
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: notion2md-server
+                port:
+                  number: 80
