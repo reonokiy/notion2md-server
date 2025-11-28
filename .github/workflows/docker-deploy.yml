@@ -3,8 +3,22 @@ name: Docker Deploy
 on:
   push:
     branches: ["main"]
+    paths:
+      - "src/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "Dockerfile"
+      - "docker-bake.hcl"
+      - ".github/workflows/docker-deploy.yml"
   pull_request:
     branches: ["main"]
+    paths:
+      - "src/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "Dockerfile"
+      - "docker-bake.hcl"
+      - ".github/workflows/docker-deploy.yml"
   workflow_dispatch:
 
 env:
