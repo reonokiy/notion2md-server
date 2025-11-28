@@ -38,6 +38,7 @@ jobs:
           targets: notion2md-server
           set: |
             notion2md-server.platform=linux/amd64
+            notion2md-server.tags=${{ env.IMAGE }}
           push: ${{ github.event_name == 'push' }}
 
       - name: Export digest
@@ -74,6 +75,7 @@ jobs:
           targets: notion2md-server
           set: |
             notion2md-server.platform=linux/arm64
+            notion2md-server.tags=${{ env.IMAGE }}
           push: ${{ github.event_name == 'push' }}
 
       - name: Export digest
