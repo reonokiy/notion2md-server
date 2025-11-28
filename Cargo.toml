@@ -1,0 +1,12 @@
+[package]
+name = "notion2md-server"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+notion-client = "1.0.11"
+notion2md = "0.1.0-alpha.3"
+logforth = { version = "0.27.0", features = ["append-opentelemetry", "rustls", "colored", "layout-json"] }
+log = "0.4"
+axum = "0.7"
+tokio = { version = "1", features = ["full"] }
