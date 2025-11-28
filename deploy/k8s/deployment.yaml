@@ -1,0 +1,47 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: notion2md-server
+  labels:
+    app: notion2md-server
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: notion2md-server
+  template:
+    metadata:
+      labels:
+        app: notion2md-server
+    spec:
+      containers:
+        - name: notion2md-server
+          image: ghcr.io/reonokiy/notion2md-server:latest
+          imagePullPolicy: IfNotPresent
+          ports:
+            - containerPort: 3000
+              name: http
+          env:
+            - name: RUST_LOG
+              value: info
+          resources:
+            requests:
+              cpu: 10m
+              memory: 32Mi
+            limits:
+              cpu: 100m
+              memory: 128Mi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: notion2md-server
+  labels:
+    app: notion2md-server
+spec:
+  selector:
+    app: notion2md-server
+  ports:
+    - name: http
+      port: 80
+      targetPort: http
