@@ -39,6 +39,8 @@ jobs:
           set: |
             notion2md-server.platform=linux/amd64
             notion2md-server.tags=${{ env.IMAGE }}
+            notion2md-server.cache-to=type=registry,ref=ghcr.io/${{ github.repository }}/notion2md-server:buildcache,mode=max,compression=zstd
+            notion2md-server.cache-from=type=registry,ref=ghcr.io/${{ github.repository }}/notion2md-server:buildcache
           push: ${{ github.event_name == 'push' }}
 
       - name: Export digest
@@ -76,6 +78,8 @@ jobs:
           set: |
             notion2md-server.platform=linux/arm64
             notion2md-server.tags=${{ env.IMAGE }}
+            notion2md-server.cache-to=type=registry,ref=ghcr.io/${{ github.repository }}/notion2md-server:buildcache,mode=max,compression=zstd
+            notion2md-server.cache-from=type=registry,ref=ghcr.io/${{ github.repository }}/notion2md-server:buildcache
           push: ${{ github.event_name == 'push' }}
 
       - name: Export digest
