@@ -1,0 +1,7 @@
+default_provider = "onepassword"
+
+[providers.onepassword]
+type = "1password"
+
+[secrets]
+NOTION_API_KEY = { provider = "onepassword", value = "op://dev/notion/API_KEY" }
