@@ -105,8 +105,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
 
     let app = Router::new()
-        .route("/page/:id", get(get_markdown_page))
-        .route("/database/:id", get(list_database_pages))
+        .route("/page/{id}", get(get_markdown_page))
+        .route("/database/{id}", get(list_database_pages))
         .layer(middleware::from_fn(log_requests))
         .with_state(state);
 
