@@ -1,18 +1,23 @@
-use std::{net::SocketAddr, time::Instant};
+use std::{net::SocketAddr, sync::Arc, time::Instant};
 
 use axum::{
     Router,
     body::Body,
-    extract::Path,
-    http::{HeaderMap, HeaderValue, Request, StatusCode, header},
+    extract::{Path, State, FromRequestParts},
+    http::{HeaderMap, HeaderValue, Request, StatusCode, header, request::Parts},
     middleware::{self, Next},
     response::{IntoResponse, Response},
     routing::get,
 };
+use axum_extra::headers::authorization::Bearer;
+use axum_extra::headers::{Authorization, HeaderMapExt};
 use log::{error, info, warn};
-use logforth::{append, filter::EnvFilter};
+use logforth::{filter::env_filter::EnvFilterBuilder, starter_log};
 use notion_client::endpoints::Client as NotionClient;
+use notion_client::endpoints::databases::query::request::QueryDatabaseRequest;
+use notion_client::objects::page::{Page, PageProperty};
 use notion2md::builder::NotionToMarkdownBuilder;
+use notion2md::notion_to_md::NotionToMarkdown;
 
 struct MarkdownResponse(String);
 
@@ -34,18 +39,76 @@ impl IntoResponse for MarkdownResponse {
     }
 }
 
+struct AppState {
+    default_client: NotionClient,
+    default_to_markdown: Arc<NotionToMarkdown>,
+}
+
+struct MaybeBearerToken(Option<String>);
+
+impl<S> FromRequestParts<S> for MaybeBearerToken
+where
+    S: Send + Sync,
+{
+    type Rejection = StatusCode;
+
+    fn from_request_parts(
+        parts: &mut Parts,
+        _state: &S,
+    ) -> impl std::future::Future<Output = Result<Self, Self::Rejection>> + Send {
+        let headers = parts.headers.clone();
+
+        let token = headers
+            .typed_get::<Authorization<Bearer>>()
+            .map(|Authorization(bearer)| bearer.token().to_string())
+            .or_else(|| {
+                headers.get("Auth").and_then(|value| match value.to_str() {
+                    Ok(value) => {
+                        let trimmed = value.trim();
+                        if trimmed.is_empty() {
+                            None
+                        } else {
+                            Some(trimmed.to_string())
+                        }
+                    }
+                    Err(_) => {
+                        warn!("failed to read Auth header as UTF-8");
+                        None
+                    }
+                })
+            });
+
+        async move { Ok(MaybeBearerToken(token)) }
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    logforth::builder()
-        .dispatch(|d| {
-            d.filter(EnvFilter::from_default_env_or("info"))
-                .append(append::Stdout::default())
-        })
+    starter_log::stdout()
+        .filter(EnvFilterBuilder::from_default_env_or("info").build())
         .apply();
+
+    let state = {
+        let notion_token = std::env::var("NOTION_API_KEY").map_err(|err| {
+            error!("missing NOTION_API_KEY: {err}");
+            err
+        })?;
+
+        let default_client = NotionClient::new(notion_token, None)?;
+        let default_to_markdown =
+            Arc::new(NotionToMarkdownBuilder::new(default_client.clone()).build());
+
+        Arc::new(AppState {
+            default_client,
+            default_to_markdown,
+        })
+    };
 
     let app = Router::new()
         .route("/page/:id", get(get_markdown_page))
-        .layer(middleware::from_fn(log_requests));
+        .route("/database/:id", get(list_database_pages))
+        .layer(middleware::from_fn(log_requests))
+        .with_state(state);
 
     let addr = SocketAddr::from(([0, 0, 0, 0], 3000));
     info!("listening on {addr}");
@@ -58,6 +121,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 async fn get_markdown_page(
     Path(id): Path<String>,
     headers: HeaderMap,
+    MaybeBearerToken(token): MaybeBearerToken,
+    State(state): State<Arc<AppState>>,
 ) -> Result<MarkdownResponse, StatusCode> {
     if !accepts_markdown(&headers) {
         warn!("missing markdown Accept header for {id}");
@@ -69,22 +134,113 @@ async fn get_markdown_page(
         return Err(StatusCode::BAD_REQUEST);
     }
 
-    let notion_token = extract_notion_token(&headers)?;
-    let notion_client = NotionClient::new(notion_token, None).map_err(|err| {
-        error!("failed to create notion client for {id}: {err:?}");
-        StatusCode::UNAUTHORIZED
+    let converter = markdown_converter_for_request(&state, token)?;
+
+    let markdown = converter.convert_page(&id).await.map_err(|err| {
+        error!("failed to render notion page {id}: {err:?}");
+        StatusCode::BAD_GATEWAY
     })?;
 
-    let markdown = NotionToMarkdownBuilder::new(notion_client)
-        .build()
-        .convert_page(&id)
+    Ok(markdown.into())
+}
+
+async fn list_database_pages(
+    Path(id): Path<String>,
+    headers: HeaderMap,
+    MaybeBearerToken(token): MaybeBearerToken,
+    State(state): State<Arc<AppState>>,
+) -> Result<MarkdownResponse, StatusCode> {
+    if !accepts_markdown(&headers) {
+        warn!("missing markdown Accept header for {id}");
+        return Err(StatusCode::NOT_ACCEPTABLE);
+    }
+
+    if id.contains('/') || id.contains("..") {
+        warn!("invalid database id: {id}");
+        return Err(StatusCode::BAD_REQUEST);
+    }
+
+    let notion_client = notion_client_for_request(&state, token)?;
+
+    let response = notion_client
+        .databases
+        .query_a_database(&id, QueryDatabaseRequest::default())
         .await
         .map_err(|err| {
-            error!("failed to render notion page {id}: {err:?}");
+            error!("failed to query notion database {id}: {err:?}");
             StatusCode::BAD_GATEWAY
         })?;
 
+    let markdown = build_database_markdown(&id, &response.results);
     Ok(markdown.into())
+}
+
+fn build_database_markdown(id: &str, pages: &[Page]) -> String {
+    let mut lines = vec![format!("# Database {id}"), String::new()];
+
+    if pages.is_empty() {
+        lines.push("_No pages found._".to_string());
+    } else {
+        lines.extend(pages.iter().map(|page| {
+            let title = page_title(page);
+            format!("- [{title}]({})", page.url)
+        }));
+    }
+
+    lines.join("\n")
+}
+
+fn page_title(page: &Page) -> String {
+    page.properties
+        .values()
+        .find_map(|property| {
+            if let PageProperty::Title { title, .. } = property {
+                let text = title
+                    .iter()
+                    .filter_map(|rich| rich.plain_text())
+                    .collect::<String>();
+                let trimmed = text.trim();
+
+                if trimmed.is_empty() {
+                    None
+                } else {
+                    Some(trimmed.to_string())
+                }
+            } else {
+                None
+            }
+        })
+        .unwrap_or_else(|| "Untitled page".to_string())
+}
+
+fn notion_client_for_request(
+    state: &AppState,
+    token: Option<String>,
+) -> Result<NotionClient, StatusCode> {
+    if let Some(token) = token {
+        NotionClient::new(token, None).map_err(|err| {
+            error!("failed to create notion client from header token: {err:?}");
+            StatusCode::UNAUTHORIZED
+        })
+    } else {
+        Ok(state.default_client.clone())
+    }
+}
+
+fn markdown_converter_for_request(
+    state: &AppState,
+    token: Option<String>,
+) -> Result<Arc<NotionToMarkdown>, StatusCode> {
+    if let Some(token) = token {
+        let client = NotionClient::new(token, None).map_err(|err| {
+            error!("failed to create notion client from header token: {err:?}");
+            StatusCode::UNAUTHORIZED
+        })?;
+
+        Ok(Arc::new(NotionToMarkdownBuilder::new(client).build()))
+    } else {
+        Ok(state.default_to_markdown.clone())
+    }
 }
 
 fn accepts_markdown(headers: &HeaderMap) -> bool {
@@ -98,32 +254,6 @@ fn accepts_markdown(headers: &HeaderMap) -> bool {
             item.starts_with("text/markdown") || item.starts_with("text/*") || item == "*/*"
         }),
     }
-}
-
-fn extract_notion_token(headers: &HeaderMap) -> Result<String, StatusCode> {
-    let token_value = headers
-        .get("Auth")
-        .or_else(|| headers.get(header::AUTHORIZATION))
-        .and_then(|value| value.to_str().ok())
-        .map(str::trim);
-
-    let Some(value) = token_value else {
-        warn!("missing Auth header");
-        return Err(StatusCode::UNAUTHORIZED);
-    };
-
-    let token = if let Some(stripped) = value.strip_prefix("Bearer ") {
-        stripped.trim()
-    } else {
-        value
-    };
-
-    if token.is_empty() {
-        warn!("Auth header present but empty");
-        return Err(StatusCode::UNAUTHORIZED);
-    }
-
-    Ok(token.to_string())
 }
 
 async fn log_requests(req: Request<Body>, next: Next) -> Response {
