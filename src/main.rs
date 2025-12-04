@@ -1,9 +1,9 @@
-use std::{net::SocketAddr, sync::Arc, time::Instant};
+use std::{net::SocketAddr, time::Instant};
 
 use axum::{
     Router,
     body::Body,
-    extract::{Path, State, FromRequestParts},
+    extract::{FromRequestParts, Path},
     http::{HeaderMap, HeaderValue, Request, StatusCode, header, request::Parts},
     middleware::{self, Next},
     response::{IntoResponse, Response},
@@ -37,11 +37,6 @@ impl IntoResponse for MarkdownResponse {
 
         (headers, self.0).into_response()
     }
-}
-
-struct AppState {
-    default_client: NotionClient,
-    default_to_markdown: Arc<NotionToMarkdown>,
 }
 
 struct MaybeBearerToken(Option<String>);
@@ -88,27 +83,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .filter(EnvFilterBuilder::from_default_env_or("info").build())
         .apply();
 
-    let state = {
-        let notion_token = std::env::var("NOTION_API_KEY").map_err(|err| {
-            error!("missing NOTION_API_KEY: {err}");
-            err
-        })?;
-
-        let default_client = NotionClient::new(notion_token, None)?;
-        let default_to_markdown =
-            Arc::new(NotionToMarkdownBuilder::new(default_client.clone()).build());
-
-        Arc::new(AppState {
-            default_client,
-            default_to_markdown,
-        })
-    };
-
     let app = Router::new()
         .route("/page/{id}", get(get_markdown_page))
         .route("/database/{id}", get(list_database_pages))
-        .layer(middleware::from_fn(log_requests))
-        .with_state(state);
+        .layer(middleware::from_fn(log_requests));
 
     let addr = SocketAddr::from(([0, 0, 0, 0], 3000));
     info!("listening on {addr}");
@@ -122,7 +100,6 @@ async fn get_markdown_page(
     Path(id): Path<String>,
     headers: HeaderMap,
     MaybeBearerToken(token): MaybeBearerToken,
-    State(state): State<Arc<AppState>>,
 ) -> Result<MarkdownResponse, StatusCode> {
     if !accepts_markdown(&headers) {
         warn!("missing markdown Accept header for {id}");
@@ -134,7 +111,8 @@ async fn get_markdown_page(
         return Err(StatusCode::BAD_REQUEST);
     }
 
-    let converter = markdown_converter_for_request(&state, token)?;
+    let token = notion_token_from_header(token)?;
+    let converter = markdown_converter_from_token(&token)?;
 
     let markdown = converter.convert_page(&id).await.map_err(|err| {
         error!("failed to render notion page {id}: {err:?}");
@@ -148,7 +126,6 @@ async fn list_database_pages(
     Path(id): Path<String>,
     headers: HeaderMap,
     MaybeBearerToken(token): MaybeBearerToken,
-    State(state): State<Arc<AppState>>,
 ) -> Result<MarkdownResponse, StatusCode> {
     if !accepts_markdown(&headers) {
         warn!("missing markdown Accept header for {id}");
@@ -160,7 +137,8 @@ async fn list_database_pages(
         return Err(StatusCode::BAD_REQUEST);
     }
 
-    let notion_client = notion_client_for_request(&state, token)?;
+    let token = notion_token_from_header(token)?;
+    let notion_client = notion_client_from_token(&token)?;
 
     let response = notion_client
         .databases
@@ -213,34 +191,23 @@ fn page_title(page: &Page) -> String {
         .unwrap_or_else(|| "Untitled page".to_string())
 }
 
-fn notion_client_for_request(
-    state: &AppState,
-    token: Option<String>,
-) -> Result<NotionClient, StatusCode> {
-    if let Some(token) = token {
-        NotionClient::new(token, None).map_err(|err| {
-            error!("failed to create notion client from header token: {err:?}");
-            StatusCode::UNAUTHORIZED
-        })
-    } else {
-        Ok(state.default_client.clone())
-    }
+fn notion_token_from_header(token: Option<String>) -> Result<String, StatusCode> {
+    token.ok_or_else(|| {
+        warn!("missing Notion token in request headers");
+        StatusCode::UNAUTHORIZED
+    })
 }
 
-fn markdown_converter_for_request(
-    state: &AppState,
-    token: Option<String>,
-) -> Result<Arc<NotionToMarkdown>, StatusCode> {
-    if let Some(token) = token {
-        let client = NotionClient::new(token, None).map_err(|err| {
-            error!("failed to create notion client from header token: {err:?}");
-            StatusCode::UNAUTHORIZED
-        })?;
+fn notion_client_from_token(token: &str) -> Result<NotionClient, StatusCode> {
+    NotionClient::new(token.to_string(), None).map_err(|err| {
+        error!("failed to create notion client from header token: {err:?}");
+        StatusCode::UNAUTHORIZED
+    })
+}
 
-        Ok(Arc::new(NotionToMarkdownBuilder::new(client).build()))
-    } else {
-        Ok(state.default_to_markdown.clone())
-    }
+fn markdown_converter_from_token(token: &str) -> Result<NotionToMarkdown, StatusCode> {
+    let client = notion_client_from_token(token)?;
+    Ok(NotionToMarkdownBuilder::new(client).build())
 }
 
 fn accepts_markdown(headers: &HeaderMap) -> bool {
