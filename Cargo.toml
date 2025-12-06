@@ -12,3 +12,4 @@ axum = "0.8"
 tokio = { version = "1", features = ["full"] }
 axum-extra = { version = "0.12", features = ["typed-header"] }
 serde = { version = "1", features = ["derive"] }
+chrono = { version = "0.4", features = ["serde"] }

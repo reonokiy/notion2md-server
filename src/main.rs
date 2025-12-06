@@ -1,4 +1,4 @@
-use std::{net::SocketAddr, time::Instant};
+use std::{collections::HashMap, net::SocketAddr, time::Instant};
 
 use axum::{
     Json, Router,
@@ -6,13 +6,15 @@ use axum::{
     extract::{FromRequestParts, Path, Query},
     http::{HeaderMap, Request, StatusCode, header, request::Parts},
     middleware::{self, Next},
-    response::Response,
+    response::{IntoResponse, Response},
     routing::get,
 };
 use axum_extra::headers::authorization::Bearer;
 use axum_extra::headers::{Authorization, HeaderMapExt};
+use chrono::{DateTime, Utc};
 use log::{error, info, warn};
 use logforth::{filter::env_filter::EnvFilterBuilder, starter_log};
+use notion_client::NotionClientError;
 use notion_client::endpoints::Client as NotionClient;
 use notion_client::endpoints::databases::query::request::QueryDatabaseRequest;
 use notion_client::objects::page::{
@@ -82,13 +84,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 async fn get_page(
     Path(id): Path<String>,
     headers: HeaderMap,
+    Query(params): Query<GetPageParams>,
     MaybeBearerToken(token): MaybeBearerToken,
-) -> Result<Json<Page>, StatusCode> {
-    if !accepts_json(&headers) {
-        warn!("missing json Accept header for {id}");
-        return Err(StatusCode::NOT_ACCEPTABLE);
-    }
-
+) -> Result<Response, StatusCode> {
     if id.contains('/') || id.contains("..") {
         warn!("invalid page id: {id}");
         return Err(StatusCode::BAD_REQUEST);
@@ -97,81 +95,80 @@ async fn get_page(
     let token = notion_token_from_header(token)?;
     let client = notion_client_from_token(&token)?;
     let converter = NotionToMarkdownBuilder::new(client.clone()).build();
-
-    let markdown = converter.convert_page(&id).await.map_err(|err| {
-        error!("failed to render notion page {id}: {err:?}");
-        StatusCode::BAD_GATEWAY
-    })?;
+    let format = page_response_format(&headers);
 
     let notion_page = client
         .pages
         .retrieve_a_page(&id, None)
         .await
         .map_err(|err| {
+            let status = map_notion_error(&err);
             error!("failed to retrieve notion page {id}: {err:?}");
-            StatusCode::BAD_GATEWAY
+            status
         })?;
 
-    let page = notion_page_to_response(notion_page, Some(markdown));
+    let properties = notion_page_to_properties(&notion_page);
 
-    Ok(Json(page))
+    let markdown = converter.convert_page(&id).await.map_err(|err| {
+        error!("failed to render notion page {id}: {err:?}");
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
+
+    match format {
+        PageResponseFormat::Json => {
+            let response = PageJsonResponse {
+                id: notion_page.id.clone(),
+                properties,
+                content: markdown,
+            };
+            Ok(Json(response).into_response())
+        }
+        PageResponseFormat::Markdown => {
+            let content = if params.frontmatter.unwrap_or(false) {
+                apply_frontmatter(&properties, &markdown)
+            } else {
+                markdown
+            };
+            Ok((
+                [(header::CONTENT_TYPE, "text/markdown; charset=utf-8")],
+                content,
+            )
+                .into_response())
+        }
+    }
+}
+
+#[derive(Deserialize)]
+struct GetPageParams {
+    frontmatter: Option<bool>,
 }
 
 #[derive(Serialize)]
-struct Page {
+struct PageJsonResponse {
     id: String,
-    properties: Vec<PagePropertyItem>,
-    markdown: Option<String>,
-}
-
-#[derive(Serialize, Clone)]
-struct PagePropertyItem {
-    id: String,
-    #[serde(flatten)]
-    value: PropertyValue,
-}
-
-#[derive(Serialize, Clone)]
-#[serde(tag = "type", content = "content")]
-enum PropertyValue {
-    Title(String),
-    RichText(String),
-    Select(String),
-    MultiSelect(Vec<String>),
-    Status(String),
-    Checkbox(bool),
-    Number(f64),
-    Url(String),
-    Email(String),
-    Phone(String),
-    Date(String),
+    properties: HashMap<String, PropertyValue>,
+    content: String,
 }
 
 #[derive(Deserialize)]
 struct ListDatabaseParams {
-    start: Option<usize>,
-    page_size: Option<usize>,
+    offset: Option<usize>,
+    limit: Option<usize>,
 }
 
 #[derive(Serialize)]
 struct ListDatabasePagesResponse {
     total: usize,
+    offset: usize,
+    limit: usize,
     pages: Vec<String>,
-    start: usize,
-    page_size: usize,
 }
 
 async fn list_database_pages(
     Path(id): Path<String>,
-    headers: HeaderMap,
     Query(params): Query<ListDatabaseParams>,
     MaybeBearerToken(token): MaybeBearerToken,
 ) -> Result<Json<ListDatabasePagesResponse>, StatusCode> {
-    if !accepts_json(&headers) {
-        warn!("missing json Accept header for {id}");
-        return Err(StatusCode::NOT_ACCEPTABLE);
-    }
-
     if id.contains('/') || id.contains("..") {
         warn!("invalid database id: {id}");
         return Err(StatusCode::BAD_REQUEST);
@@ -179,18 +176,19 @@ async fn list_database_pages(
 
     let token = notion_token_from_header(token)?;
     let notion_client = notion_client_from_token(&token)?;
-    let start = params.start.unwrap_or(0);
-    let page_size = params.page_size.unwrap_or(100);
-    if page_size == 0 {
-        warn!("page_size of zero requested for database {id}");
+    let offset = params.offset.unwrap_or(0);
+    let limit = params.limit.unwrap_or(20);
+    if limit == 0 {
+        warn!("limit of zero requested for database {id}");
         return Err(StatusCode::BAD_REQUEST);
     }
 
     let mut cursor: Option<String> = None;
-    let mut skipped = 0usize;
-    let mut pages: Vec<String> = Vec::with_capacity(page_size);
+    let mut skipped = 0_usize;
+    let mut total = 0_usize;
+    let mut pages: Vec<String> = Vec::with_capacity(limit);
 
-    while pages.len() < page_size {
+    loop {
         let request = QueryDatabaseRequest {
             start_cursor: cursor.clone(),
             page_size: Some(100),
@@ -202,142 +200,150 @@ async fn list_database_pages(
             .query_a_database(&id, request)
             .await
             .map_err(|err| {
+                let status = map_notion_error(&err);
                 error!("failed to query notion database {id}: {err:?}");
-                StatusCode::BAD_GATEWAY
+                status
             })?;
 
         let next_cursor = response.next_cursor.clone();
+        total += response.results.len();
 
         for page in response.results {
-            if skipped < start {
+            if skipped < offset {
                 skipped += 1;
                 continue;
             }
 
-            if pages.len() < page_size {
+            if pages.len() < limit {
                 pages.push(page.id);
-            } else {
-                break;
             }
         }
 
-        if pages.len() >= page_size || next_cursor.is_none() {
+        if next_cursor.is_none() {
             break;
         }
 
         cursor = next_cursor;
     }
 
-    let size = pages.len();
-
     Ok(Json(ListDatabasePagesResponse {
-        total: size,
+        total,
         pages,
-        start,
-        page_size,
+        offset,
+        limit,
     }))
 }
 
-fn notion_page_to_response(page: NotionPage, markdown: Option<String>) -> Page {
-    let mut properties = Vec::new();
-
-    for (_key, property) in page.properties.into_iter() {
-        if let Ok(value) = PagePropertyItem::try_from(property) {
-            properties.push(value);
-        }
-    }
-
-    Page {
-        id: page.id,
-        properties,
-        markdown,
-    }
+enum PageResponseFormat {
+    Json,
+    Markdown,
 }
 
-impl TryFrom<NotionPageProperty> for PagePropertyItem {
-    type Error = ();
+fn page_response_format(headers: &HeaderMap) -> PageResponseFormat {
+    let content_type = headers
+        .get(header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok());
 
-    fn try_from(property: NotionPageProperty) -> Result<Self, Self::Error> {
-        match property {
-            NotionPageProperty::Title { id, title } => rich_text_to_string(&title)
-                .map(|text| PagePropertyItem {
-                    id: id.unwrap_or_default(),
-                    value: PropertyValue::Title(text),
-                })
-                .ok_or(()),
-            NotionPageProperty::RichText { id, rich_text } => rich_text_to_string(&rich_text)
-                .map(|text| PagePropertyItem {
-                    id: id.unwrap_or_default(),
-                    value: PropertyValue::RichText(text),
-                })
-                .ok_or(()),
-            NotionPageProperty::Select { id, select } => select
-                .and_then(|value| value.name)
-                .map(|selected| PagePropertyItem {
-                    id: id.unwrap_or_default(),
-                    value: PropertyValue::Select(selected),
-                })
-                .ok_or(()),
-            NotionPageProperty::Status { id, status } => status
-                .and_then(|value| value.name)
-                .map(|name| PagePropertyItem {
-                    id: id.unwrap_or_default(),
-                    value: PropertyValue::Status(name),
-                })
-                .ok_or(()),
-            NotionPageProperty::MultiSelect { id, multi_select } => {
-                let values: Vec<String> = multi_select
-                    .into_iter()
-                    .filter_map(|item| item.name)
-                    .collect();
-
-                if values.is_empty() {
-                    Err(())
-                } else {
-                    Ok(PagePropertyItem {
-                        id: id.unwrap_or_default(),
-                        value: PropertyValue::MultiSelect(values),
-                    })
-                }
-            }
-            NotionPageProperty::Checkbox { id, checkbox } => Ok(PagePropertyItem {
-                id: id.unwrap_or_default(),
-                value: PropertyValue::Checkbox(checkbox),
-            }),
-            NotionPageProperty::Number { id, number } => number
-                .and_then(|value| value.as_f64())
-                .map(|number| PagePropertyItem {
-                    id: id.unwrap_or_default(),
-                    value: PropertyValue::Number(number),
-                })
-                .ok_or(()),
-            NotionPageProperty::Url { id, url } => url
-                .map(|value| PagePropertyItem {
-                    id: id.unwrap_or_default(),
-                    value: PropertyValue::Url(value),
-                })
-                .ok_or(()),
-            NotionPageProperty::Email { id, email } => email
-                .map(|value| PagePropertyItem {
-                    id: id.unwrap_or_default(),
-                    value: PropertyValue::Email(value),
-                })
-                .ok_or(()),
-            NotionPageProperty::PhoneNumber { id, phone_number } => phone_number
-                .map(|value| PagePropertyItem {
-                    id: id.unwrap_or_default(),
-                    value: PropertyValue::Phone(value),
-                })
-                .ok_or(()),
-            NotionPageProperty::Date { id, date } => date
-                .and_then(date_to_string)
-                .map(|value| PagePropertyItem {
-                    id: id.unwrap_or_default(),
-                    value: PropertyValue::Date(value),
-                })
-                .ok_or(()),
-            _ => Err(()),
+    if let Some(content_type) = content_type {
+        if content_type.starts_with("text/markdown") {
+            return PageResponseFormat::Markdown;
         }
+    }
+
+    let accept = headers
+        .get(header::ACCEPT)
+        .and_then(|value| value.to_str().ok());
+
+    if let Some(value) = accept {
+        for item in value.split(',').map(str::trim) {
+            if item.starts_with("text/markdown") || item.starts_with("text/*") {
+                return PageResponseFormat::Markdown;
+            }
+
+            if item.starts_with("application/json") || item.starts_with("application/*") {
+                return PageResponseFormat::Json;
+            }
+
+            if item == "*/*" {
+                return PageResponseFormat::Json;
+            }
+        }
+    }
+
+    PageResponseFormat::Json
+}
+
+fn notion_page_to_properties(page: &NotionPage) -> HashMap<String, PropertyValue> {
+    let mut properties = HashMap::new();
+
+    for (name, property) in page.properties.iter() {
+        if let Some(value) = property_to_value(property.clone()) {
+            properties.insert(name.clone(), value);
+        }
+    }
+
+    properties
+}
+
+#[derive(Serialize, Clone)]
+#[serde(untagged)]
+enum PropertyValue {
+    String(String),
+    Number(f64),
+    Boolean(bool),
+    StringArray(Vec<String>),
+    DateTime(DateTime<Utc>),
+}
+
+fn property_to_value(property: NotionPageProperty) -> Option<PropertyValue> {
+    match property {
+        NotionPageProperty::Title { title, .. } => {
+            rich_text_to_string(&title).map(PropertyValue::String)
+        }
+        NotionPageProperty::RichText { rich_text, .. } => {
+            rich_text_to_string(&rich_text).map(PropertyValue::String)
+        }
+        NotionPageProperty::Select { select, .. } => select
+            .and_then(|value| value.name)
+            .map(PropertyValue::String),
+        NotionPageProperty::Status { status, .. } => status
+            .and_then(|value| value.name)
+            .map(PropertyValue::String),
+        NotionPageProperty::MultiSelect { multi_select, .. } => {
+            let values: Vec<String> = multi_select
+                .into_iter()
+                .filter_map(|item| item.name)
+                .collect();
+
+            if values.is_empty() {
+                None
+            } else {
+                Some(PropertyValue::StringArray(values))
+            }
+        }
+        NotionPageProperty::Checkbox { checkbox, .. } => Some(PropertyValue::Boolean(checkbox)),
+        NotionPageProperty::Number { number, .. } => number
+            .and_then(|value| value.as_f64())
+            .map(PropertyValue::Number),
+        NotionPageProperty::Url { url, .. } => url.map(PropertyValue::String),
+        NotionPageProperty::Email { email, .. } => email.map(PropertyValue::String),
+        NotionPageProperty::PhoneNumber { phone_number, .. } => {
+            phone_number.map(PropertyValue::String)
+        }
+        NotionPageProperty::Date { date, .. } => {
+            date.and_then(date_to_datetime).map(PropertyValue::DateTime)
+        }
+        NotionPageProperty::CreatedTime { created_time, .. } => {
+            Some(PropertyValue::DateTime(created_time))
+        }
+        NotionPageProperty::LastEditedTime {
+            last_edited_time, ..
+        } => last_edited_time.map(PropertyValue::DateTime),
+        NotionPageProperty::People { people, .. } => {
+            let names: Vec<String> = people.into_iter().filter_map(|user| user.name).collect();
+            (!names.is_empty()).then(|| PropertyValue::StringArray(names))
+        }
+        _ => None,
     }
 }
 
@@ -355,14 +361,65 @@ fn rich_text_to_string(text: &[RichText]) -> Option<String> {
     }
 }
 
-fn date_to_string(date: DatePropertyValue) -> Option<String> {
-    date.start.map(date_or_datetime_to_string)
+fn date_to_datetime(date: DatePropertyValue) -> Option<DateTime<Utc>> {
+    date.start.and_then(date_or_datetime_to_datetime)
 }
 
-fn date_or_datetime_to_string(date: DateOrDateTime) -> String {
+fn date_or_datetime_to_datetime(date: DateOrDateTime) -> Option<DateTime<Utc>> {
     match date {
-        DateOrDateTime::Date(date) => date.to_string(),
-        DateOrDateTime::DateTime(date_time) => date_time.to_rfc3339(),
+        DateOrDateTime::Date(date) => date
+            .and_hms_opt(0, 0, 0)
+            .map(|dt| DateTime::<Utc>::from_naive_utc_and_offset(dt, Utc)),
+        DateOrDateTime::DateTime(date_time) => Some(date_time),
+    }
+}
+
+fn apply_frontmatter(properties: &HashMap<String, PropertyValue>, markdown: &str) -> String {
+    if properties.is_empty() {
+        return markdown.to_string();
+    }
+
+    let mut entries: Vec<_> = properties.iter().collect();
+    entries.sort_by(|a, b| a.0.cmp(b.0));
+
+    let mut frontmatter = String::from("---\n");
+    for (key, value) in entries {
+        let rendered = property_value_to_string(value);
+        let escaped = rendered
+            .replace('\\', "\\\\")
+            .replace('\n', "\\n")
+            .replace('"', "\\\"");
+        frontmatter.push_str(&format!("{key}: \"{escaped}\"\n"));
+    }
+    frontmatter.push_str("---\n\n");
+    frontmatter.push_str(markdown);
+    frontmatter
+}
+
+fn property_value_to_string(value: &PropertyValue) -> String {
+    match value {
+        PropertyValue::String(value) => value.clone(),
+        PropertyValue::Number(value) => value.to_string(),
+        PropertyValue::Boolean(value) => value.to_string(),
+        PropertyValue::StringArray(values) => values.join(", "),
+        PropertyValue::DateTime(value) => value.to_rfc3339(),
+    }
+}
+
+fn map_notion_error(err: &NotionClientError) -> StatusCode {
+    match err {
+        NotionClientError::InvalidStatusCode { error } => match error.status {
+            400 => StatusCode::BAD_REQUEST,
+            401 | 403 => StatusCode::UNAUTHORIZED,
+            404 => StatusCode::NOT_FOUND,
+            _ => StatusCode::INTERNAL_SERVER_ERROR,
+        },
+        NotionClientError::InvalidHeader { .. } => StatusCode::UNAUTHORIZED,
+        NotionClientError::FailedToSerialize { .. }
+        | NotionClientError::FailedToDeserialize { .. }
+        | NotionClientError::FailedToRequest { .. }
+        | NotionClientError::FailedToText { .. }
+        | NotionClientError::FailedToBuildRequest { .. } => StatusCode::INTERNAL_SERVER_ERROR,
     }
 }
 
@@ -378,21 +435,6 @@ fn notion_client_from_token(token: &str) -> Result<NotionClient, StatusCode> {
         error!("failed to create notion client from header token: {err:?}");
         StatusCode::UNAUTHORIZED
     })
-}
-
-fn accepts_json(headers: &HeaderMap) -> bool {
-    let accept = headers
-        .get(header::ACCEPT)
-        .and_then(|value| value.to_str().ok());
-
-    match accept {
-        None => true,
-        Some(value) => value.split(',').map(str::trim).any(|item| {
-            item.starts_with("application/json")
-                || item.starts_with("application/*")
-                || item == "*/*"
-        }),
-    }
 }
 
 async fn log_requests(req: Request<Body>, next: Next) -> Response {
