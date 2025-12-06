@@ -1,0 +1,12 @@
+[package]
+name = "notion-opendal"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+notion-client = { workspace = true }
+notion2md = { workspace = true }
+chrono = { workspace = true }
+opendal = { workspace = true }
+serde = { workspace = true }
+log = { workspace = true }
